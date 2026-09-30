@@ -1,0 +1,17 @@
+
+.env
+.env.*
+!.env.example
+.azure/
+data/*.json
+output/
+artifacts/
+node_modules/
+dist/
+.venv/
+venv/
+__pycache__/
+*.pyc
+bin/
+obj/
+target/
