@@ -1,6 +1,7 @@
 package vectorstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -138,16 +139,29 @@ func decodeOwned(raw bson.M, dimensions int) (record, error) {
 	if r.Owner != Owner || r.ID != "agent-go:"+r.Hotel.HotelID || r.Digest != digest(r.Hotel) || validateHotel(r.Hotel) != nil || safety.Vector(r.Hotel.DescriptionVector, dimensions) != nil {
 		return r, errors.New("refusing foreign or modified data")
 	}
-	allowed, _ := bson.Marshal(r)
-	var known bson.M
-	_ = bson.Unmarshal(allowed, &known)
-	if len(raw) != len(known) {
-		return r, errors.New("refusing data with foreign fields")
+	allowed, err := bson.Marshal(r)
+	if err != nil {
+		return r, safety.Protect("ownership schema encoding", err)
 	}
-	for key := range raw {
-		if _, ok := known[key]; !ok {
-			return r, errors.New("refusing data with foreign fields")
-		}
+	// Decode every nested document as a map so comparison is order-independent,
+	// but retains unknown fields and original BSON values throughout the tree.
+	canonical := func(data []byte) (bson.M, error) {
+		decoder := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(data)))
+		decoder.DefaultDocumentM()
+		var value bson.M
+		err := decoder.Decode(&value)
+		return value, err
+	}
+	actual, err := canonical(encoded)
+	if err != nil {
+		return r, safety.Protect("ownership canonical decode", err)
+	}
+	known, err := canonical(allowed)
+	if err != nil {
+		return r, safety.Protect("ownership schema decode", err)
+	}
+	if !reflect.DeepEqual(actual, known) {
+		return r, errors.New("refusing data with foreign fields or noncanonical values")
 	}
 	return r, nil
 }
@@ -328,7 +342,9 @@ func (vs *VectorStore) Cleanup(ctx context.Context) error {
 		return nil
 	}
 	// Re-read each exact document and use its full snapshot in the delete predicate.
-	// A concurrent update no longer matches and causes count mismatch/nonzero.
+	// Changed existing values no longer match and cause count mismatch/nonzero.
+	// This is not whole-document equality: concurrent additions can still match.
+	// Exclusive writers are required; tags/snapshots are accident-prevention only.
 	snapshots := bson.A{}
 	for _, id := range ids {
 		var raw bson.M

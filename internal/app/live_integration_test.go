@@ -5,7 +5,6 @@ package app
 import (
 	"context"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -102,15 +101,16 @@ func TestLiveAgent(t *testing.T) {
 	if err != nil || len(ids) != 3 {
 		t.Fatal("idempotent seed did not retain exactly 3 rows", err)
 	}
-	answer, err := agents.New(model, agents.NewVectorSearchTool(model, store)).Run(ctx, "Recommend a quiet hotel near running trails, compare available options", 3)
+	recorded := &recordingSearchStore{delegate: store}
+	answer, err := agents.New(model, agents.NewVectorSearchTool(model, recorded)).Run(ctx, "Recommend a quiet hotel near running trails, compare available options", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(answer) == "" || (!strings.Contains(answer, "Trail House") && !strings.Contains(answer, "City Rooms") && !strings.Contains(answer, "Beach Lodge")) {
+	if !recorded.answerMentionsRetrievedHotel(answer) {
 		t.Fatal("genuine synthesis did not reference any retrieved hotel")
 	}
 	if model.Calls() != 6 {
 		t.Fatalf("expected 3 seed embeddings + planner + query embedding + synthesis, got %d", model.Calls())
 	}
-	t.Logf("LIVE PASS: DB auth=%s model auth=%s; 3 real 1536D seed embeddings, repeat seed remains 3; real planner/tool/query embedding/DB search/synthesis; 6 total inference requests. Scoped cleanup follows.", db.AuthMode, config.AuthMode)
+	t.Logf("LIVE INFERENCE CHECKS PASSED (cleanup/test result pending): DB auth=%s model auth=%s; 3 real 1536D seed embeddings, repeat seed remains 3; real planner/tool/query embedding/DB search/synthesis; 6 total inference requests. Scoped cleanup follows.", db.AuthMode, config.AuthMode)
 }

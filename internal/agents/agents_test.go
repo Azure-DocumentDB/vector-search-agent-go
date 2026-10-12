@@ -115,3 +115,23 @@ func TestQueryInjectionIsOnlyEmbeddingText(t *testing.T) {
 		t.Fatal("missing budget")
 	}
 }
+
+func TestCaseVariantToolKeysRejectedBeforeDownstreamCalls(t *testing.T) {
+	for _, raw := range []string{
+		`{"QUERY":"hotel","nearestNeighbors":3}`,
+		`{"query":"hotel","nearestneighbors":3}`,
+		`{"query":"hotel","QUERY":"other","nearestNeighbors":3}`,
+		`{"query":"hotel","nearestNeighbors":3,"NearestNeighbors":2}`,
+		`{"Query":"hotel","NearestNeighbors":3}`,
+	} {
+		if _, err := parseToolArguments(raw); err == nil {
+			t.Fatalf("case variant accepted: %s", raw)
+		}
+		model := &modelStub{plan: makePlan(t, "search_hotels_collection", raw)}
+		embed := &embedStub{}
+		store := &storeStub{}
+		if _, err := New(model, NewVectorSearchTool(embed, store)).Run(context.Background(), "hotel", 3); err == nil || embed.calls != 0 || store.calls != 0 || model.synth != 0 {
+			t.Fatal("case-variant arguments reached downstream calls")
+		}
+	}
+}

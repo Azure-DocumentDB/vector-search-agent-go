@@ -1,6 +1,7 @@
 package vectorstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -288,5 +289,72 @@ func TestCompatibleIndexAcceptedAndMismatchRefused(t *testing.T) {
 	store.config.Algorithm = "vector-hnsw"
 	if _, err := store.InspectOwned(context.Background()); err == nil {
 		t.Fatal("incompatible index accepted")
+	}
+}
+
+func TestNestedForeignFieldsRefusedBeforeAnyMutation(t *testing.T) {
+	original := doc(hotel())
+	raw, _ := bson.Marshal(original)
+	decoder := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(raw)))
+	decoder.DefaultDocumentM()
+	var document bson.M
+	if err := decoder.Decode(&document); err != nil {
+		t.Fatal(err)
+	}
+	address, ok := document["Address"].(bson.M)
+	if !ok {
+		t.Fatal("address fixture")
+	}
+	address["CustomerNote"] = "foreign nested edit"
+	raw, _ = bson.Marshal(document)
+	var foreign bson.D
+	if err := bson.Unmarshal(raw, &foreign); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"inspect", "seed", "cleanup", "cleanup-reread"} {
+		t.Run(operation, func(t *testing.T) {
+			responses := []bson.D{cursorResponse(foreign)}
+			if operation == "cleanup-reread" {
+				responses = []bson.D{cursorResponse(original), cursorResponse(), cursorResponse(foreign)}
+			}
+			store, events := mockStore(t, responses...)
+			var err error
+			switch operation {
+			case "inspect":
+				_, err = store.InspectOwned(context.Background())
+			case "seed":
+				err = store.InsertHotelsWithEmbeddings(context.Background(), []models.HotelForVectorStore{hotel()})
+			default:
+				err = store.Cleanup(context.Background())
+			}
+			if err == nil {
+				t.Fatal("foreign nested field accepted")
+			}
+			for _, e := range *events {
+				if e.CommandName == "delete" || e.CommandName == "update" || e.CommandName == "insert" || strings.HasPrefix(e.CommandName, "drop") {
+					t.Fatal("foreign nested edit reached mutation")
+				}
+			}
+		})
+	}
+}
+func TestOwnedNestedBSONOrderIsNotSignificant(t *testing.T) {
+	d := doc(hotel())
+	for i, field := range d {
+		if field.Key == "Address" {
+			address := field.Value.(bson.D)
+			for l, r := 0, len(address)-1; l < r; l, r = l+1, r-1 {
+				address[l], address[r] = address[r], address[l]
+			}
+			d[i].Value = address
+		}
+	}
+	raw, _ := bson.Marshal(d)
+	var document bson.M
+	if err := bson.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeOwned(document, 3); err != nil {
+		t.Fatal("nested document order caused rejection", err)
 	}
 }

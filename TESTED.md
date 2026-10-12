@@ -8,7 +8,7 @@ Environment: macOS arm64, **Go 1.26.9**. Dependency upgrades include MongoDB dri
 
 Passed locally:
 
-- `go test -json -count=1 -timeout=2m ./...`: **29 top-level tests / 43 including named subtests**, all pass. Table-driven cases add additional assertions beyond this count.
+- `go test -json -count=1 -timeout=2m ./...`: **33 top-level tests / 51 including named subtests**, all pass. Table-driven cases add additional assertions beyond this count.
 - `go test -race -count=1 -timeout=2m ./...`: pass.
 - `go vet ./...`, `go build ./...`, `go mod verify`: pass.
 - `go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...`: **0 reachable symbol findings, 0 imported-package findings**. The module graph also contains **GO-2026-5932**, the unmaintained `golang.org/x/crypto/openpgp` package (no fixed release); that package is **not imported**. The module is needed for modern SCRAM/crypto dependencies; this advisory is disclosed, not suppressed. Verbose scanner output was reviewed.
@@ -30,3 +30,9 @@ Passed locally:
 The opt-in integration test is runnable as documented in [README.md](README.md). It uses only `agent_go_disposable_live_gate.agent_hotels`, a maximum six planned inference calls, three actual 1536D seed vectors, repeated idempotent seed, IVF, genuine planner/query embedding/DB search/synthesis, and cleanup. No local/mock fallback is enabled. It refuses absent consent or an initially populated/foreign target. HNSW and DiskANN are **not covered by that live gate**.
 
 GitHub Actions execution, Linux/stable-Go matrix, live API-key/native+Entra behavior, tier capability, semantic recommendation quality, model cost totals, and performance are **not claimed by local build/mock results**. Publication/remote changes are outside this repair worker's scope.
+
+## Independent review corrections — 2026-10-12
+
+Three finite review findings were repaired and regression-tested: ownership comparison now preserves and compares canonical BSON recursively (including unknown nested `Address.CustomerNote` fields) with order-insensitive documents; the tool parser permits only the exact key spellings `query` and `nearestNeighbors`, rejecting case variants before any embedding/search/synthesis; the live gate records the real delegated search result and checks names from that actual subset, not every seeded name. The local grounding counterexample returns only Trail House and refuses answers mentioning only City Rooms/Beach Lodge. No extra inference requests or live mocks were added.
+
+Cleanup snapshot predicates detect changed existing values, but do not provide whole-document equality or prevent concurrent new-field additions after reread. Exclusive writers remain required. Regression tests prove nested foreign data is refused during inspect, seed, initial cleanup, and cleanup reread before any mutation. The intermediate live log is now explicitly labeled inference checks passed with cleanup/test result pending: only the enclosing test's final success proves completed cleanup.

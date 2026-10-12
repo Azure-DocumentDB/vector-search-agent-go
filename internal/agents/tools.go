@@ -83,7 +83,7 @@ func parseToolArguments(raw string) (toolArguments, error) {
 			return args, errors.New("invalid tool arguments")
 		}
 		name, ok := key.(string)
-		if !ok || seen[name] {
+		if !ok || (name != "query" && name != "nearestNeighbors") || seen[name] {
 			return args, errors.New("duplicate or invalid tool argument")
 		}
 		seen[name] = true
