@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"io"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -275,7 +276,7 @@ func searchPipeline(vector []float32, k int) mongo.Pipeline {
 	return mongo.Pipeline{
 		{{Key: "$search", Value: bson.D{{Key: "cosmosSearch", Value: bson.D{{Key: "vector", Value: vector}, {Key: "path", Value: "DescriptionVector"}, {Key: "k", Value: k}}}}}},
 		{{Key: "$match", Value: bson.D{{Key: "agentOwner", Value: Owner}}}},
-		{{Key: "$project", Value: bson.D{{Key: "score", Value: bson.D{{Key: "$meta", Value: "searchScore"}}}, {Key: "document", Value: "$$ROOT"}}}},
+		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 0}, {Key: "score", Value: bson.D{{Key: "$meta", Value: "searchScore"}}}, {Key: "hotelID", Value: "$_id"}}}},
 		{{Key: "$limit", Value: k}},
 	}
 }
@@ -302,19 +303,40 @@ func (vs *VectorStore) VectorSearch(ctx context.Context, vector []float32, k int
 			err = safety.Protect("search cursor close", e)
 		}
 	}()
+	// Search aggregation can add service metadata or normalize BSON values.
+	// Use only its bounded ranking (owned ID + score); hydrate each result with an
+	// ordinary scoped find, then apply the unchanged strict stored-record guard.
+	// Never relax mutation ownership checks to accommodate search representations.
+	allowed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		allowed[id] = true
+	}
+	seen := map[string]bool{}
 	for cursor.Next(ctx) {
 		var row struct {
-			Score    float64 `bson:"score"`
-			Document bson.M  `bson:"document"`
+			Score *float64 `bson:"score"`
+			ID    string   `bson:"hotelID"`
 		}
 		if e := cursor.Decode(&row); e != nil {
-			return nil, safety.Protect("search decode", e)
+			return nil, safety.Protect("search ranking decode", e)
 		}
-		r, e := decodeOwned(row.Document, vs.config.Dimensions)
+		if !allowed[row.ID] || seen[row.ID] || row.Score == nil || math.IsNaN(*row.Score) || math.IsInf(*row.Score, 0) {
+			return nil, errors.New("search returned an invalid, duplicate, or unowned ranking")
+		}
+		seen[row.ID] = true
+		var stored bson.M
+		filter := bson.D{{Key: "_id", Value: row.ID}, {Key: "agentOwner", Value: Owner}}
+		if e := vs.collection.FindOne(ctx, filter).Decode(&stored); e != nil {
+			return nil, safety.Protect("search owned-record read", e)
+		}
+		r, e := decodeOwned(stored, vs.config.Dimensions)
 		if e != nil {
 			return nil, e
 		}
-		results = append(results, models.HotelSearchResult{Hotel: r.Hotel, Score: row.Score})
+		if r.ID != row.ID {
+			return nil, errors.New("search owned-record ID mismatch")
+		}
+		results = append(results, models.HotelSearchResult{Hotel: r.Hotel, Score: *row.Score})
 		if len(results) > k {
 			return nil, errors.New("search exceeded result bound")
 		}

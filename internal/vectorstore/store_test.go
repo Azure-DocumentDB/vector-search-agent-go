@@ -14,6 +14,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/drivertest"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -213,7 +214,7 @@ func TestCleanupOnlyExactOwnedIDsNoDrops(t *testing.T) {
 }
 func TestActualVectorIndexAndSearchCommands(t *testing.T) {
 	d := doc(hotel())
-	store, events := mockStore(t, cursorResponse(d), cursorResponse(), okResponse(1), cursorResponse(d), cursorResponse(), cursorResponse(bson.D{{Key: "score", Value: 1.0}, {Key: "document", Value: d}}))
+	store, events := mockStore(t, cursorResponse(d), cursorResponse(), okResponse(1), cursorResponse(d), cursorResponse(), cursorResponse(bson.D{{Key: "score", Value: 1.0}, {Key: "hotelID", Value: "agent-go:1"}}), cursorResponse(d))
 	if err := store.CreateVectorIndex(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +225,7 @@ func TestActualVectorIndexAndSearchCommands(t *testing.T) {
 	for _, e := range *events {
 		if e.CommandName == "aggregate" {
 			text := e.Command.String()
-			if !strings.Contains(text, "cosmosSearch") || !strings.Contains(text, "DescriptionVector") || strings.Contains(text, "$where") {
+			if !strings.Contains(text, "cosmosSearch") || !strings.Contains(text, "DescriptionVector") || strings.Contains(text, "$where") || strings.Contains(text, "$$ROOT") || !strings.Contains(text, "hotelID") {
 				t.Fatal("unsafe search pipeline")
 			}
 		}
@@ -356,5 +357,77 @@ func TestOwnedNestedBSONOrderIsNotSignificant(t *testing.T) {
 	}
 	if _, err := decodeOwned(document, 3); err != nil {
 		t.Fatal("nested document order caused rejection", err)
+	}
+}
+
+func TestSearchHydratesStrictOwnedRecordsNotAggregateDocuments(t *testing.T) {
+	stored := doc(hotel())
+	// Service representation is intentionally not accepted as a stored document.
+	// Even if metadata or a different representation reaches the ranking result,
+	// only the known ID/score is used; the model receives the independently read row.
+	ranking := bson.D{{Key: "score", Value: 0.9}, {Key: "hotelID", Value: "agent-go:1"}, {Key: "document", Value: bson.D{{Key: "HotelName", Value: "Untrusted aggregate representation"}, {Key: "serviceMetadata", Value: true}}}}
+	store, events := mockStore(t, cursorResponse(stored), cursorResponse(), cursorResponse(ranking), cursorResponse(stored))
+	results, err := store.VectorSearch(context.Background(), []float32{1, 0, 0}, 3)
+	if err != nil || len(results) != 1 || results[0].Hotel.HotelName != "Trail House" || results[0].Score != 0.9 {
+		t.Fatal("search did not use strict owned hydration", err)
+	}
+	finds := 0
+	for _, e := range *events {
+		if e.CommandName == "find" {
+			finds++
+			if finds == 2 {
+				var cmd struct {
+					Filter bson.M `bson:"filter"`
+				}
+				if bson.Unmarshal(e.Command, &cmd) != nil || cmd.Filter["_id"] != "agent-go:1" || cmd.Filter["agentOwner"] != Owner || len(cmd.Filter) != 2 {
+					t.Fatal("hydration was not exact owned ID")
+				}
+			}
+		}
+	}
+	if finds != 2 {
+		t.Fatal("missing preflight or actual stored-record hydration")
+	}
+}
+func TestSearchRejectsForeignHydratedRecordAndInvalidRanking(t *testing.T) {
+	stored := doc(hotel())
+	for _, rank := range []bson.D{
+		{{Key: "score", Value: 1.0}, {Key: "hotelID", Value: "foreign-id"}},
+		{{Key: "hotelID", Value: "agent-go:1"}},
+		{{Key: "score", Value: math.NaN()}, {Key: "hotelID", Value: "agent-go:1"}},
+	} {
+		store, events := mockStore(t, cursorResponse(stored), cursorResponse(), cursorResponse(rank))
+		if _, err := store.VectorSearch(context.Background(), []float32{1, 0, 0}, 3); err == nil {
+			t.Fatal("invalid ranking accepted")
+		}
+		finds := 0
+		for _, e := range *events {
+			if e.CommandName == "find" {
+				finds++
+			}
+		}
+		if finds != 1 {
+			t.Fatal("invalid ranking reached hydration")
+		}
+	}
+	raw, _ := bson.Marshal(stored)
+	decoder := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(raw)))
+	decoder.DefaultDocumentM()
+	var foreign bson.M
+	if decoder.Decode(&foreign) != nil {
+		t.Fatal("fixture")
+	}
+	foreign["Address"].(bson.M)["CustomerNote"] = "foreign nested mutation"
+	raw, _ = bson.Marshal(foreign)
+	var modified bson.D
+	_ = bson.Unmarshal(raw, &modified)
+	rank := bson.D{{Key: "score", Value: 1.0}, {Key: "hotelID", Value: "agent-go:1"}}
+	store, _ := mockStore(t, cursorResponse(stored), cursorResponse(), cursorResponse(rank), cursorResponse(modified))
+	if _, err := store.VectorSearch(context.Background(), []float32{1, 0, 0}, 3); err == nil {
+		t.Fatal("hydration weakened nested foreign-data protection")
+	}
+	store, _ = mockStore(t, cursorResponse(stored), cursorResponse(), cursorResponse(rank, rank), cursorResponse(stored))
+	if _, err := store.VectorSearch(context.Background(), []float32{1, 0, 0}, 3); err == nil {
+		t.Fatal("duplicate ranking accepted")
 	}
 }
