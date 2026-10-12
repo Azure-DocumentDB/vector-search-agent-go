@@ -365,7 +365,7 @@ func TestSearchHydratesStrictOwnedRecordsNotAggregateDocuments(t *testing.T) {
 	// Service representation is intentionally not accepted as a stored document.
 	// Even if metadata or a different representation reaches the ranking result,
 	// only the known ID/score is used; the model receives the independently read row.
-	ranking := bson.D{{Key: "score", Value: 0.9}, {Key: "hotelID", Value: "agent-go:1"}, {Key: "document", Value: bson.D{{Key: "HotelName", Value: "Untrusted aggregate representation"}, {Key: "serviceMetadata", Value: true}}}}
+	ranking := bson.D{{Key: "score", Value: 0.9}, {Key: "hotelID", Value: "agent-go:1"}, {Key: "document", Value: bson.D{{Key: "HotelName", Value: "Untrusted aggregate representation"}, {Key: "__cosmos_meta__", Value: bson.D{{Key: "score", Value: 0.9}}}}}}
 	store, events := mockStore(t, cursorResponse(stored), cursorResponse(), cursorResponse(ranking), cursorResponse(stored))
 	results, err := store.VectorSearch(context.Background(), []float32{1, 0, 0}, 3)
 	if err != nil || len(results) != 1 || results[0].Hotel.HotelName != "Trail House" || results[0].Score != 0.9 {
@@ -429,5 +429,28 @@ func TestSearchRejectsForeignHydratedRecordAndInvalidRanking(t *testing.T) {
 	store, _ = mockStore(t, cursorResponse(stored), cursorResponse(), cursorResponse(rank, rank), cursorResponse(stored))
 	if _, err := store.VectorSearch(context.Background(), []float32{1, 0, 0}, 3); err == nil {
 		t.Fatal("duplicate ranking accepted")
+	}
+}
+
+func TestStoredCosmosMetadataStillRefused(t *testing.T) {
+	stored := append(doc(hotel()), bson.E{Key: "__cosmos_meta__", Value: bson.D{{Key: "score", Value: 0.9}}})
+	for _, operation := range []string{"inspect", "cleanup"} {
+		t.Run(operation, func(t *testing.T) {
+			store, events := mockStore(t, cursorResponse(stored))
+			var err error
+			if operation == "inspect" {
+				_, err = store.InspectOwned(context.Background())
+			} else {
+				err = store.Cleanup(context.Background())
+			}
+			if err == nil {
+				t.Fatal("server metadata name in stored data bypassed strict ownership")
+			}
+			for _, e := range *events {
+				if e.CommandName == "delete" {
+					t.Fatal("stored foreign metadata deleted")
+				}
+			}
+		})
 	}
 }
