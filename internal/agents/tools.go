@@ -2,103 +2,107 @@ package agents
 
 import (
 	"context"
-	"fmt"
+	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 
-	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/clients"
+	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/models"
 	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/prompts"
-	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/vectorstore"
+	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/safety"
 	"github.com/openai/openai-go/v3"
 )
 
-// VectorSearchTool implements the hotel search functionality
+type SearchStore interface {
+	VectorSearch(context.Context, []float32, int) ([]models.HotelSearchResult, error)
+}
+type Embedder interface {
+	GenerateEmbedding(context.Context, string) ([]float32, error)
+}
 type VectorSearchTool struct {
-	openAIClients *clients.OpenAIClients
-	vectorStore   *vectorstore.VectorStore
-	debug         bool
+	embedder Embedder
+	store    SearchStore
 }
 
-// NewVectorSearchTool creates a new vector search tool
-func NewVectorSearchTool(openaiClients *clients.OpenAIClients, vectorStore *vectorstore.VectorStore, debug bool) *VectorSearchTool {
-	return &VectorSearchTool{
-		openAIClients: openaiClients,
-		vectorStore:   vectorStore,
-		debug:         debug,
+func NewVectorSearchTool(embedder Embedder, store SearchStore) *VectorSearchTool {
+	return &VectorSearchTool{embedder, store}
+}
+func (t *VectorSearchTool) Execute(ctx context.Context, query string, k int) (string, error) {
+	if err := safety.Query(query, k); err != nil {
+		return "", err
 	}
-}
-
-// Execute performs the vector search
-func (t *VectorSearchTool) Execute(ctx context.Context, query string, nearestNeighbors int) (string, error) {
-	// Generate embedding for query
-	queryVector, err := t.openAIClients.GenerateEmbedding(ctx, query)
+	vector, err := t.embedder.GenerateEmbedding(ctx, query)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate embedding: %w", err)
+		return "", err
 	}
-
-	// Perform vector search
-	results, err := t.vectorStore.VectorSearch(ctx, queryVector, nearestNeighbors)
+	results, err := t.store.VectorSearch(ctx, vector, k)
 	if err != nil {
-		return "", fmt.Errorf("vector search failed: %w", err)
+		return "", err
 	}
-
-	// Format results for synthesizer
-	var formattedResults []string
-	for i, result := range results {
-		fmt.Printf("Hotel #%d: %s, Score: %.6f\n", i+1, result.Hotel.HotelName, result.Score)
-		formattedResults = append(formattedResults, vectorstore.FormatHotelForSynthesizer(result))
+	if len(results) == 0 || len(results) > k {
+		return "", errors.New("search returned invalid result count")
 	}
-
-	return strings.Join(formattedResults, "\n\n"), nil
+	for i := range results {
+		results[i].Hotel.DescriptionVector = nil
+	}
+	data, err := json.Marshal(results)
+	if err != nil || len(data) > 65536 {
+		return "", errors.New("search context invalid or too large")
+	}
+	return string(data), nil
 }
-
-// GetToolDefinition returns the Azure OpenAI tool definition
 func (t *VectorSearchTool) GetToolDefinition() openai.ChatCompletionToolUnionParam {
-	paramSchema := map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"query": map[string]any{
-				"type":        "string",
-				"description": "Natural language search query describing desired hotel characteristics",
-			},
-			"nearestNeighbors": map[string]any{
-				"type":        "integer",
-				"description": "Number of results to return (1-20)",
-				"default":     5,
-			},
-		},
-		"required": []string{"query", "nearestNeighbors"},
-	}
-
-	return openai.ChatCompletionToolUnionParam{
-		OfFunction: &openai.ChatCompletionFunctionToolParam{
-			Function: openai.FunctionDefinitionParam{
-				Name:        prompts.ToolName,
-				Description: openai.String(prompts.ToolDescription),
-				Parameters:  paramSchema,
-			},
-		},
-	}
+	return openai.ChatCompletionToolUnionParam{OfFunction: &openai.ChatCompletionFunctionToolParam{Function: openai.FunctionDefinitionParam{Name: prompts.ToolName, Description: openai.String(prompts.ToolDescription), Strict: openai.Bool(true), Parameters: map[string]any{
+		"type": "object", "additionalProperties": false, "properties": map[string]any{
+			"query":            map[string]any{"type": "string", "minLength": 1, "maxLength": 2048},
+			"nearestNeighbors": map[string]any{"type": "integer", "minimum": 1, "maximum": 20},
+		}, "required": []string{"query", "nearestNeighbors"},
+	}}}}
 }
 
-// toolArguments represents the arguments for the search tool
 type toolArguments struct {
 	Query            string `json:"query"`
 	NearestNeighbors int    `json:"nearestNeighbors"`
 }
 
-// parseToolArgumentsFromMap parses tool arguments from a map
-func parseToolArgumentsFromMap(argsMap map[string]any) (*toolArguments, error) {
-	args := &toolArguments{}
-
-	if query, ok := argsMap["query"].(string); ok {
-		args.Query = query
-	} else {
-		return nil, fmt.Errorf("query argument missing or invalid")
+func parseToolArguments(raw string) (toolArguments, error) {
+	var args toolArguments
+	if len(raw) > 4096 {
+		return args, errors.New("tool arguments too large")
 	}
-
-	if nn, ok := argsMap["nearestNeighbors"].(float64); ok {
-		args.NearestNeighbors = int(nn)
+	// Detect duplicate keys before typed decoding: encoding/json alone accepts them.
+	dec := json.NewDecoder(strings.NewReader(raw))
+	start, err := dec.Token()
+	if err != nil || start != json.Delim('{') {
+		return args, errors.New("tool arguments must be one JSON object")
 	}
-
-	return args, nil
+	seen := map[string]bool{}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return args, errors.New("invalid tool arguments")
+		}
+		name, ok := key.(string)
+		if !ok || seen[name] {
+			return args, errors.New("duplicate or invalid tool argument")
+		}
+		seen[name] = true
+		var value json.RawMessage
+		if dec.Decode(&value) != nil {
+			return args, errors.New("invalid tool argument JSON")
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return args, errors.New("invalid tool object")
+	}
+	dec = json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&args) != nil {
+		return args, errors.New("invalid tool argument types or unknown fields")
+	}
+	var extra any
+	if dec.Decode(&extra) != io.EOF || len(seen) != 2 {
+		return args, errors.New("tool arguments require exactly query and nearestNeighbors")
+	}
+	return args, safety.Query(args.Query, args.NearestNeighbors)
 }
