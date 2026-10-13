@@ -1,432 +1,397 @@
 package vectorstore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/models"
+	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/safety"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"io"
+	"math"
 	"os"
-	"strconv"
+	"reflect"
 	"strings"
 	"time"
-
-	"github.com/Azure-DocumentDB/vector-search-agent-go/internal/models"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// VectorStoreConfig holds MongoDB configuration
-type VectorStoreConfig struct {
-	ConnectionString string
-	ClusterName      string // For passwordless authentication
-	DatabaseName     string
-	CollectionName   string
-	IndexName        string
-	EmbeddedField    string // Field name for vector embeddings
-	UsePasswordless  bool
-	Debug            bool
-}
-
-// VectorStore manages MongoDB operations for vector search
 type VectorStore struct {
-	config     *VectorStoreConfig
+	config     VectorStoreConfig
 	client     *mongo.Client
 	database   *mongo.Database
 	collection *mongo.Collection
 }
-
-// LoadConfigFromEnv loads vector store configuration from environment
-func LoadConfigFromEnv() *VectorStoreConfig {
-	debug := os.Getenv("DEBUG") == "true" || os.Getenv("DEBUG") == "1"
-	usePasswordless := os.Getenv("USE_PASSWORDLESS") == "true" || os.Getenv("USE_PASSWORDLESS") == "1"
-
-	embeddedField := os.Getenv("EMBEDDED_FIELD")
-	if embeddedField == "" {
-		embeddedField = "DescriptionVector"
-	}
-
-	return &VectorStoreConfig{
-		ConnectionString: os.Getenv("AZURE_DOCUMENTDB_CONNECTION_STRING"),
-		ClusterName:      os.Getenv("AZURE_DOCUMENTDB_CLUSTER"),
-		DatabaseName:     os.Getenv("AZURE_DOCUMENTDB_DATABASENAME"),
-		CollectionName:   os.Getenv("AZURE_DOCUMENTDB_COLLECTION"),
-		IndexName:        os.Getenv("AZURE_DOCUMENTDB_INDEX_NAME"),
-		EmbeddedField:    embeddedField,
-		UsePasswordless:  usePasswordless,
-		Debug:            debug,
-	}
+type record struct {
+	ID     string                     `bson:"_id"`
+	Owner  string                     `bson:"agentOwner"`
+	Digest string                     `bson:"agentDigest"`
+	Hotel  models.HotelForVectorStore `bson:",inline"`
 }
 
-// NewVectorStore creates a new vector store connection with passwordless authentication support
-func NewVectorStore(ctx context.Context, config *VectorStoreConfig) (*VectorStore, error) {
-	var client *mongo.Client
-	var err error
-
-	// Determine authentication method based on USE_PASSWORDLESS flag or auto-detection
-	usePasswordless := config.UsePasswordless || (config.ConnectionString == "" && config.ClusterName != "")
-
-	if usePasswordless {
-		// Use passwordless authentication with Azure Identity
-		if config.Debug {
-			fmt.Println("[vectorstore] Using passwordless (OIDC) authentication")
-		}
-		if config.ClusterName == "" {
-			return nil, fmt.Errorf("AZURE_DOCUMENTDB_CLUSTER is required for passwordless authentication")
-		}
-		client, err = connectWithOIDC(ctx, config.ClusterName, config.Debug)
-		if err != nil {
-			return nil, fmt.Errorf("OIDC authentication failed: %w", err)
-		}
-	} else {
-		// Use connection string authentication
-		if config.Debug {
-			fmt.Println("[vectorstore] Using connection string authentication")
-		}
-		if config.ConnectionString == "" {
-			return nil, fmt.Errorf("AZURE_DOCUMENTDB_CONNECTION_STRING is required when USE_PASSWORDLESS is not enabled")
-		}
-		clientOptions := options.Client().ApplyURI(config.ConnectionString)
-		client, err = mongo.Connect(ctx, clientOptions)
-		if err != nil {
-			return nil, fmt.Errorf("failed to connect to MongoDB: %w", err)
-		}
-	}
-
-	// Ping to verify connection
-	if err := client.Ping(ctx, nil); err != nil {
-		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
-	}
-
-	database := client.Database(config.DatabaseName)
-	collection := database.Collection(config.CollectionName)
-
-	if config.Debug {
-		fmt.Printf("[vectorstore] Connected to database: %s, collection: %s\n", config.DatabaseName, config.CollectionName)
-	}
-
-	return &VectorStore{
-		config:     config,
-		client:     client,
-		database:   database,
-		collection: collection,
-	}, nil
+func digest(h models.HotelForVectorStore) string {
+	// BSON timestamps have millisecond precision; canonicalize before hashing.
+	h.LastRenovationDate = h.LastRenovationDate.UTC().Truncate(time.Millisecond)
+	data, _ := json.Marshal(h)
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
 }
-
-// connectWithOIDC creates a MongoDB client using OIDC authentication
-func connectWithOIDC(ctx context.Context, clusterName string, debug bool) (*mongo.Client, error) {
-	// Create Azure credential
-	credential, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Azure credential: %w", err)
+func validateHotel(h models.HotelForVectorStore) error {
+	if !safety.Identifier(h.HotelID) || strings.TrimSpace(h.HotelName) == "" || len(h.HotelName) > 256 || strings.TrimSpace(h.Description) == "" || len(h.Description) > 8192 || h.LastRenovationDate.Year() < 1 || h.LastRenovationDate.Year() > 9999 {
+		return errors.New("invalid hotel ID, name, or description")
 	}
-
-	// Construct MongoDB URI for Azure DocumentDB
-	mongoURI := fmt.Sprintf("mongodb+srv://%s.global.mongocluster.cosmos.azure.com/", clusterName)
-
-	if debug {
-		fmt.Printf("[vectorstore] Attempting OIDC authentication to %s\n", clusterName)
+	data, err := json.Marshal(h)
+	if err != nil || len(data) > 32768 {
+		return errors.New("invalid or oversized hotel record")
 	}
-
-	// Create OIDC machine callback using Azure credential
-	oidcCallback := func(ctx context.Context, args *options.OIDCArgs) (*options.OIDCCredential, error) {
-		scope := "https://ossrdbms-aad.database.windows.net/.default"
-		if debug {
-			fmt.Printf("[vectorstore] Getting token with scope: %s\n", scope)
-		}
-		token, err := credential.GetToken(ctx, policy.TokenRequestOptions{
-			Scopes: []string{scope},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to get token with scope %s: %w", scope, err)
-		}
-
-		if debug {
-			fmt.Println("[vectorstore] Successfully obtained token")
-		}
-
-		return &options.OIDCCredential{
-			AccessToken: token.Token,
-		}, nil
-	}
-
-	// Set up MongoDB client options with OIDC authentication
-	clientOptions := options.Client().
-		ApplyURI(mongoURI).
-		SetConnectTimeout(30 * time.Second).
-		SetServerSelectionTimeout(30 * time.Second).
-		SetRetryWrites(true).
-		SetAuth(options.Credential{
-			AuthMechanism: "MONGODB-OIDC",
-			// For local development, don't set ENVIRONMENT=azure to allow custom callbacks
-			AuthMechanismProperties: map[string]string{
-				"TOKEN_RESOURCE": "https://ossrdbms-aad.database.windows.net",
-			},
-			OIDCMachineCallback: oidcCallback,
-		})
-
-	mongoClient, err := mongo.Connect(ctx, clientOptions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect with OIDC: %w", err)
-	}
-
-	if debug {
-		fmt.Println("[vectorstore] OIDC authentication successful!")
-	}
-
-	return mongoClient, nil
+	return nil
 }
-
-// Close closes the MongoDB connection
-func (vs *VectorStore) Close(ctx context.Context) error {
-	return vs.client.Disconnect(ctx)
-}
-
-// LoadHotelsFromJSON loads hotels from a JSON file
-func LoadHotelsFromJSON(filePath string) ([]models.Hotel, error) {
+func LoadHotelsFromJSON(filePath string) (hotels []models.Hotel, err error) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
+		return nil, safety.Protect("data file open", err)
 	}
-	defer file.Close()
-
-	data, err := io.ReadAll(file)
+	defer func() {
+		if e := file.Close(); e != nil {
+			err = errors.Join(err, safety.Protect("data file close", e))
+		}
+	}()
+	data, err := io.ReadAll(io.LimitReader(file, 4*1024*1024+1))
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, safety.Protect("data file read", err)
 	}
-
-	var hotels []models.Hotel
+	if len(data) > 4*1024*1024 {
+		return nil, errors.New("data file exceeds 4 MiB")
+	}
 	if err := json.Unmarshal(data, &hotels); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		return nil, safety.Protect("data JSON decode", err)
 	}
-
+	if len(hotels) == 0 || len(hotels) > 50 {
+		return nil, errors.New("data file must contain 1-50 hotels")
+	}
+	seen := map[string]bool{}
+	for _, h := range hotels {
+		if err := validateHotel(h.ToVectorStore()); err != nil {
+			return nil, err
+		}
+		if seen[h.HotelID] {
+			return nil, errors.New("duplicate hotel ID")
+		}
+		seen[h.HotelID] = true
+	}
 	return hotels, nil
 }
-
-// InsertHotelsWithEmbeddings inserts hotels with their embeddings
-func (vs *VectorStore) InsertHotelsWithEmbeddings(ctx context.Context, hotels []models.HotelForVectorStore) error {
-	if len(hotels) == 0 {
-		return nil
-	}
-
-	// Convert to bson documents
-	docs := make([]any, len(hotels))
-	for i, hotel := range hotels {
-		docs[i] = hotel
-	}
-
-	result, err := vs.collection.InsertMany(ctx, docs)
-	if err != nil {
-		return fmt.Errorf("failed to insert documents: %w", err)
-	}
-
-	if vs.config.Debug {
-		fmt.Printf("[vectorstore] Inserted %d documents\n", len(result.InsertedIDs))
-	}
-
-	return nil
+func closeCursor(cursor *mongo.Cursor) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return cursor.Close(ctx)
 }
 
-// CreateVectorIndex creates a vector search index
-func (vs *VectorStore) CreateVectorIndex(ctx context.Context) error {
-	algorithm := os.Getenv("VECTOR_INDEX_ALGORITHM")
-	if algorithm == "" {
-		algorithm = "vector-ivf"
+// InspectOwned is not a multi-tenant authorization boundary: a dedicated disposable
+// DB and exclusive use are required. Foreign or modified records/indexes are refused.
+func (vs *VectorStore) InspectOwned(ctx context.Context) (ids []string, err error) {
+	if err := vs.config.Validate(); err != nil {
+		return nil, err
 	}
-
-	dimensions := 1536
-	if dimStr := os.Getenv("EMBEDDING_DIMENSIONS"); dimStr != "" {
-		if d, err := strconv.Atoi(dimStr); err == nil {
-			dimensions = d
-		}
-	}
-
-	similarity := os.Getenv("VECTOR_SIMILARITY")
-	if similarity == "" {
-		similarity = "COS"
-	}
-
-	// Build cosmosSearchOptions based on algorithm
-	var cosmosSearchOptions bson.D
-
-	switch algorithm {
-	case "vector-ivf":
-		numLists := 10
-		if nlStr := os.Getenv("IVF_NUM_LISTS"); nlStr != "" {
-			if nl, err := strconv.Atoi(nlStr); err == nil {
-				numLists = nl
-			}
-		}
-		cosmosSearchOptions = bson.D{
-			{Key: "kind", Value: "vector-ivf"},
-			{Key: "numLists", Value: numLists},
-			{Key: "dimensions", Value: dimensions},
-			{Key: "similarity", Value: similarity},
-		}
-
-	case "vector-hnsw":
-		m := 16
-		efConstruction := 64
-		if mStr := os.Getenv("HNSW_M"); mStr != "" {
-			if mVal, err := strconv.Atoi(mStr); err == nil {
-				m = mVal
-			}
-		}
-		if efStr := os.Getenv("HNSW_EF_CONSTRUCTION"); efStr != "" {
-			if efVal, err := strconv.Atoi(efStr); err == nil {
-				efConstruction = efVal
-			}
-		}
-		cosmosSearchOptions = bson.D{
-			{Key: "kind", Value: "vector-hnsw"},
-			{Key: "m", Value: m},
-			{Key: "efConstruction", Value: efConstruction},
-			{Key: "dimensions", Value: dimensions},
-			{Key: "similarity", Value: similarity},
-		}
-
-	case "vector-diskann":
-		maxDegree := 20
-		lBuild := 10
-		if mdStr := os.Getenv("DISKANN_MAX_DEGREE"); mdStr != "" {
-			if md, err := strconv.Atoi(mdStr); err == nil {
-				maxDegree = md
-			}
-		}
-		if lbStr := os.Getenv("DISKANN_L_BUILD"); lbStr != "" {
-			if lb, err := strconv.Atoi(lbStr); err == nil {
-				lBuild = lb
-			}
-		}
-		cosmosSearchOptions = bson.D{
-			{Key: "kind", Value: "vector-diskann"},
-			{Key: "maxDegree", Value: maxDegree},
-			{Key: "lBuild", Value: lBuild},
-			{Key: "dimensions", Value: dimensions},
-			{Key: "similarity", Value: similarity},
-		}
-
-	default:
-		return fmt.Errorf("unsupported vector index algorithm: %s", algorithm)
-	}
-
-	// DocumentDB uses "cosmosSearch" as the index type
-	indexDef := bson.D{
-		{Key: "createIndexes", Value: vs.config.CollectionName},
-		{Key: "indexes", Value: bson.A{
-			bson.D{
-				{Key: "name", Value: vs.config.IndexName},
-				{Key: "key", Value: bson.D{{Key: vs.config.EmbeddedField, Value: "cosmosSearch"}}},
-				{Key: "cosmosSearchOptions", Value: cosmosSearchOptions},
-			},
-		}},
-	}
-
-	if err := vs.database.RunCommand(ctx, indexDef).Err(); err != nil {
-		return fmt.Errorf("failed to create vector index: %w", err)
-	}
-
-	if vs.config.Debug {
-		fmt.Printf("[vectorstore] Created vector index: %s (algorithm: %s)\n", vs.config.IndexName, algorithm)
-	}
-
-	return nil
-}
-
-// VectorSearch performs a vector similarity search
-func (vs *VectorStore) VectorSearch(ctx context.Context, queryVector []float32, k int) ([]models.HotelSearchResult, error) {
-	// Convert float32 to any for BSON
-	vectorInterface := make([]any, len(queryVector))
-	for i, v := range queryVector {
-		vectorInterface[i] = v
-	}
-
-	pipeline := mongo.Pipeline{
-		{{Key: "$search", Value: bson.D{
-			{Key: "cosmosSearch", Value: bson.D{
-				{Key: "vector", Value: vectorInterface},
-				{Key: "path", Value: vs.config.EmbeddedField},
-				{Key: "k", Value: k},
-			}},
-		}}},
-		{{Key: "$project", Value: bson.D{
-			{Key: "score", Value: bson.D{{Key: "$meta", Value: "searchScore"}}},
-			{Key: "document", Value: "$$ROOT"},
-		}}},
-	}
-
-	cursor, err := vs.collection.Aggregate(ctx, pipeline)
+	cursor, err := vs.collection.Find(ctx, bson.D{}, options.Find().SetLimit(51))
 	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
+		return nil, safety.Protect("ownership read", err)
 	}
-	defer cursor.Close(ctx)
-
-	var results []models.HotelSearchResult
+	defer func() {
+		if e := closeCursor(cursor); e != nil && err == nil {
+			err = safety.Protect("ownership cursor close", e)
+		}
+	}()
 	for cursor.Next(ctx) {
-		var result struct {
-			Score    float64                    `bson:"score"`
-			Document models.HotelForVectorStore `bson:"document"`
+		var raw bson.M
+		if e := cursor.Decode(&raw); e != nil {
+			return nil, safety.Protect("ownership decode", e)
 		}
-		if err := cursor.Decode(&result); err != nil {
-			return nil, fmt.Errorf("failed to decode result: %w", err)
+		r, e := decodeOwned(raw, vs.config.Dimensions)
+		if e != nil {
+			return nil, e
 		}
-
-		results = append(results, models.HotelSearchResult{
-			Hotel: result.Document,
-			Score: result.Score,
-		})
+		ids = append(ids, r.ID)
+		if len(ids) > 50 {
+			return nil, errors.New("refusing collection larger than the sample limit")
+		}
 	}
-
-	if err := cursor.Err(); err != nil {
-		return nil, fmt.Errorf("cursor error: %w", err)
+	if e := cursor.Err(); e != nil {
+		return nil, safety.Protect("ownership cursor", e)
 	}
-
-	if vs.config.Debug {
-		fmt.Printf("[vectorstore] Found %d results from vector search\n", len(results))
+	if e := vs.inspectIndexes(ctx); e != nil {
+		return nil, e
 	}
+	return ids, nil
+}
+func decodeOwned(raw bson.M, dimensions int) (record, error) {
+	var r record
+	encoded, e := bson.Marshal(raw)
+	if e != nil {
+		return r, safety.Protect("ownership decode", e)
+	}
+	if e := bson.Unmarshal(encoded, &r); e != nil {
+		return r, errors.New("refusing unrecognized data")
+	}
+	if r.Owner != Owner || r.ID != "agent-go:"+r.Hotel.HotelID || r.Digest != digest(r.Hotel) || validateHotel(r.Hotel) != nil || safety.Vector(r.Hotel.DescriptionVector, dimensions) != nil {
+		return r, errors.New("refusing foreign or modified data")
+	}
+	allowed, err := bson.Marshal(r)
+	if err != nil {
+		return r, safety.Protect("ownership schema encoding", err)
+	}
+	// Decode every nested document as a map so comparison is order-independent,
+	// but retains unknown fields and original BSON values throughout the tree.
+	canonical := func(data []byte) (bson.M, error) {
+		decoder := bson.NewDecoder(bson.NewDocumentReader(bytes.NewReader(data)))
+		decoder.DefaultDocumentM()
+		var value bson.M
+		err := decoder.Decode(&value)
+		return value, err
+	}
+	actual, err := canonical(encoded)
+	if err != nil {
+		return r, safety.Protect("ownership canonical decode", err)
+	}
+	known, err := canonical(allowed)
+	if err != nil {
+		return r, safety.Protect("ownership schema decode", err)
+	}
+	if !reflect.DeepEqual(actual, known) {
+		return r, errors.New("refusing data with foreign fields or noncanonical values")
+	}
+	return r, nil
+}
+func (vs *VectorStore) inspectIndexes(ctx context.Context) (err error) {
+	cursor, err := vs.collection.Indexes().List(ctx)
+	if err != nil {
+		var cmdErr mongo.CommandError
+		if errors.As(err, &cmdErr) && cmdErr.Code == 26 {
+			return nil
+		}
+		return safety.Protect("index ownership read", err)
+	}
+	defer func() {
+		if e := closeCursor(cursor); e != nil && err == nil {
+			err = safety.Protect("index cursor close", e)
+		}
+	}()
+	for cursor.Next(ctx) {
+		var index struct {
+			Name   string `bson:"name"`
+			Key    bson.M `bson:"key"`
+			Search bson.M `bson:"cosmosSearchOptions"`
+		}
+		if e := cursor.Decode(&index); e != nil {
+			return safety.Protect("index decode", e)
+		}
+		if index.Name == "_id_" {
+			continue
+		}
+		if index.Name != IndexName || len(index.Key) != 1 || index.Key["DescriptionVector"] != "cosmosSearch" {
+			return errors.New("refusing foreign index")
+		}
+		data, _ := bson.Marshal(vs.indexOptions())
+		var expected bson.M
+		_ = bson.Unmarshal(data, &expected)
+		if !reflect.DeepEqual(index.Search, expected) {
+			return errors.New("refusing incompatible existing vector index; use a fresh disposable scope")
+		}
+	}
+	if e := cursor.Err(); e != nil {
+		return safety.Protect("index cursor", e)
+	}
+	return nil
+}
 
+// Set-on-insert and deterministic IDs never replace records or clear collections.
+// On DB failure a safe insert prefix may remain; retries fill IDs without duplicates.
+func (vs *VectorStore) InsertHotelsWithEmbeddings(ctx context.Context, hotels []models.HotelForVectorStore) error {
+	if err := vs.config.Writes(); err != nil {
+		return err
+	}
+	if len(hotels) < 1 || len(hotels) > 50 {
+		return errors.New("seed requires 1-50 embedded hotels")
+	}
+	seen := map[string]bool{}
+	for _, h := range hotels {
+		if err := validateHotel(h); err != nil {
+			return err
+		}
+		if err := safety.Vector(h.DescriptionVector, vs.config.Dimensions); err != nil {
+			return err
+		}
+		if seen[h.HotelID] {
+			return errors.New("duplicate seed ID")
+		}
+		seen[h.HotelID] = true
+	}
+	if _, err := vs.InspectOwned(ctx); err != nil {
+		return err
+	}
+	for _, h := range hotels {
+		r := record{ID: "agent-go:" + h.HotelID, Owner: Owner, Digest: digest(h), Hotel: h}
+		filter := bson.D{{Key: "_id", Value: r.ID}, {Key: "agentOwner", Value: Owner}}
+		if _, err := vs.collection.UpdateOne(ctx, filter, bson.D{{Key: "$setOnInsert", Value: r}}, options.UpdateOne().SetUpsert(true)); err != nil {
+			return safety.Protect("idempotent seed (a partial batch may exist)", err)
+		}
+	}
+	_, err := vs.InspectOwned(ctx)
+	return err
+}
+func (vs *VectorStore) indexOptions() bson.D {
+	result := bson.D{{Key: "kind", Value: vs.config.Algorithm}, {Key: "dimensions", Value: vs.config.Dimensions}, {Key: "similarity", Value: "COS"}}
+	switch vs.config.Algorithm {
+	case "vector-ivf":
+		result = append(result, bson.E{Key: "numLists", Value: 1})
+	case "vector-hnsw":
+		result = append(result, bson.E{Key: "m", Value: 16}, bson.E{Key: "efConstruction", Value: 64})
+	case "vector-diskann":
+		result = append(result, bson.E{Key: "maxDegree", Value: 32}, bson.E{Key: "lBuild", Value: 50})
+	}
+	return result
+}
+func (vs *VectorStore) CreateVectorIndex(ctx context.Context) error {
+	if err := vs.config.Writes(); err != nil {
+		return err
+	}
+	ids, err := vs.InspectOwned(ctx)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return errors.New("refusing to index an empty collection")
+	}
+	command := bson.D{{Key: "createIndexes", Value: vs.config.CollectionName}, {Key: "indexes", Value: bson.A{bson.D{{Key: "name", Value: IndexName}, {Key: "key", Value: bson.D{{Key: "DescriptionVector", Value: "cosmosSearch"}}}, {Key: "cosmosSearchOptions", Value: vs.indexOptions()}}}}}
+	if err := vs.database.RunCommand(ctx, command).Err(); err != nil {
+		return safety.Protect("vector index creation", err)
+	}
+	return nil
+}
+func searchPipeline(vector []float32, k int) mongo.Pipeline {
+	return mongo.Pipeline{
+		{{Key: "$search", Value: bson.D{{Key: "cosmosSearch", Value: bson.D{{Key: "vector", Value: vector}, {Key: "path", Value: "DescriptionVector"}, {Key: "k", Value: k}}}}}},
+		{{Key: "$match", Value: bson.D{{Key: "agentOwner", Value: Owner}}}},
+		{{Key: "$project", Value: bson.D{{Key: "_id", Value: 0}, {Key: "score", Value: bson.D{{Key: "$meta", Value: "searchScore"}}}, {Key: "hotelID", Value: "$_id"}}}},
+		{{Key: "$limit", Value: k}},
+	}
+}
+func (vs *VectorStore) VectorSearch(ctx context.Context, vector []float32, k int) (results []models.HotelSearchResult, err error) {
+	if err := safety.Query("vector search", k); err != nil {
+		return nil, err
+	}
+	if err := safety.Vector(vector, vs.config.Dimensions); err != nil {
+		return nil, err
+	}
+	ids, err := vs.InspectOwned(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, errors.New("sample collection is empty; seed it explicitly first")
+	}
+	cursor, err := vs.collection.Aggregate(ctx, searchPipeline(vector, k))
+	if err != nil {
+		return nil, safety.Protect("vector search", err)
+	}
+	defer func() {
+		if e := closeCursor(cursor); e != nil && err == nil {
+			err = safety.Protect("search cursor close", e)
+		}
+	}()
+	// Search aggregation can add service metadata or normalize BSON values.
+	// Use only its bounded ranking (owned ID + score); hydrate each result with an
+	// ordinary scoped find, then apply the unchanged strict stored-record guard.
+	// Never relax mutation ownership checks to accommodate search representations.
+	allowed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		allowed[id] = true
+	}
+	seen := map[string]bool{}
+	for cursor.Next(ctx) {
+		var row struct {
+			Score *float64 `bson:"score"`
+			ID    string   `bson:"hotelID"`
+		}
+		if e := cursor.Decode(&row); e != nil {
+			return nil, safety.Protect("search ranking decode", e)
+		}
+		if !allowed[row.ID] || seen[row.ID] || row.Score == nil || math.IsNaN(*row.Score) || math.IsInf(*row.Score, 0) {
+			return nil, errors.New("search returned an invalid, duplicate, or unowned ranking")
+		}
+		seen[row.ID] = true
+		var stored bson.M
+		filter := bson.D{{Key: "_id", Value: row.ID}, {Key: "agentOwner", Value: Owner}}
+		if e := vs.collection.FindOne(ctx, filter).Decode(&stored); e != nil {
+			return nil, safety.Protect("search owned-record read", e)
+		}
+		r, e := decodeOwned(stored, vs.config.Dimensions)
+		if e != nil {
+			return nil, e
+		}
+		if r.ID != row.ID {
+			return nil, errors.New("search owned-record ID mismatch")
+		}
+		results = append(results, models.HotelSearchResult{Hotel: r.Hotel, Score: *row.Score})
+		if len(results) > k {
+			return nil, errors.New("search exceeded result bound")
+		}
+	}
+	if e := cursor.Err(); e != nil {
+		return nil, safety.Protect("search cursor", e)
+	}
+	if len(results) == 0 {
+		return nil, errors.New("vector search returned no results")
+	}
 	return results, nil
 }
 
-// FormatHotelForSynthesizer formats a hotel result for the synthesizer agent
-func FormatHotelForSynthesizer(result models.HotelSearchResult) string {
-	hotel := result.Hotel
-	tags := strings.Join(hotel.Tags, ", ")
-
-	fields := []string{
-		"--- HOTEL START ---",
-		fmt.Sprintf("HotelId: %s", hotel.HotelID),
-		fmt.Sprintf("HotelName: %s", hotel.HotelName),
-		fmt.Sprintf("Description: %s", hotel.Description),
-		fmt.Sprintf("Category: %s", hotel.Category),
-		fmt.Sprintf("Tags: %s", tags),
-		fmt.Sprintf("ParkingIncluded: %t", hotel.ParkingIncluded),
-		fmt.Sprintf("IsDeleted: %t", hotel.IsDeleted),
-		fmt.Sprintf("LastRenovationDate: %s", hotel.LastRenovationDate.Format("2006-01-02")),
-		fmt.Sprintf("Rating: %.1f", hotel.Rating),
-		fmt.Sprintf("Address.StreetAddress: %s", hotel.Address.StreetAddress),
-		fmt.Sprintf("Address.City: %s", hotel.Address.City),
-		fmt.Sprintf("Address.StateProvince: %s", hotel.Address.StateProvince),
-		fmt.Sprintf("Address.PostalCode: %s", hotel.Address.PostalCode),
-		fmt.Sprintf("Address.Country: %s", hotel.Address.Country),
-		fmt.Sprintf("Score: %.6f", result.Score),
-		"--- HOTEL END ---",
+// Cleanup deletes only a preflighted exact list of tagged sample IDs. Never drop
+// databases, collections, or indexes. Concurrent foreign inserts cannot be deleted.
+func (vs *VectorStore) Cleanup(ctx context.Context) error {
+	if err := vs.config.Cleanup(); err != nil {
+		return err
 	}
-
-	return strings.Join(fields, "\n")
-}
-
-// DeleteDatabase drops the entire database
-func (vs *VectorStore) DeleteDatabase(ctx context.Context) error {
-	if err := vs.database.Drop(ctx); err != nil {
-		return fmt.Errorf("failed to drop database: %w", err)
+	ids, err := vs.InspectOwned(ctx)
+	if err != nil {
+		return err
 	}
-
-	if vs.config.Debug {
-		fmt.Printf("[vectorstore] Deleted database: %s\n", vs.config.DatabaseName)
+	if len(ids) == 0 {
+		return nil
 	}
-
+	// Re-read each exact document and use its full snapshot in the delete predicate.
+	// Changed existing values no longer match and cause count mismatch/nonzero.
+	// This is not whole-document equality: concurrent additions can still match.
+	// Exclusive writers are required; tags/snapshots are accident-prevention only.
+	snapshots := bson.A{}
+	for _, id := range ids {
+		var raw bson.M
+		if err := vs.collection.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(&raw); err != nil {
+			return safety.Protect("cleanup snapshot", err)
+		}
+		if _, err := decodeOwned(raw, vs.config.Dimensions); err != nil {
+			return err
+		}
+		snapshots = append(snapshots, raw)
+	}
+	filter := bson.D{{Key: "agentOwner", Value: Owner}, {Key: "_id", Value: bson.D{{Key: "$in", Value: ids}}}, {Key: "$or", Value: snapshots}}
+	result, err := vs.collection.DeleteMany(ctx, filter)
+	if err != nil {
+		return safety.Protect("scoped cleanup", err)
+	}
+	if result.DeletedCount != int64(len(ids)) {
+		return errors.New("cleanup count mismatch; concurrent mutation suspected")
+	}
+	remaining, err := vs.InspectOwned(ctx)
+	if err != nil {
+		return err
+	}
+	if len(remaining) != 0 {
+		return errors.New("cleanup left sample rows; exclusive access required")
+	}
 	return nil
 }
